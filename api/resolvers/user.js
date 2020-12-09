@@ -1,8 +1,13 @@
 import bcrypt from 'bcryptjs';
+import mongoose from 'mongoose';
+import { withFilter } from 'apollo-server';
 
 import { uploadToCloudinary } from '../utils/cloudinary';
 import { generateToken } from '../utils/generate-token';
 import { sendEmail } from '../utils/email';
+import { pubSub } from '../utils/apollo-server';
+
+import { IS_USER_ONLINE } from '../constants/Subscriptions';
 
 const AUTH_TOKEN_EXPIRY = '1y';
 const RESET_PASSWORD_TOKEN_EXPIRY = 3600000;
@@ -11,10 +16,11 @@ const Query = {
   /**
    * Gets the currently logged in user
    */
-  getAuthUser: async (root, args, { authUser, User }) => {
+  getAuthUser: async (root, args, { authUser, Message, User }) => {
     if (!authUser) return null;
 
-    const user = await User.findOne({ email: authUser.email })
+    // If user is authenticated, update it's isOnline field to true
+    const user = await User.findOneAndUpdate({ email: authUser.email }, { isOnline: true })
       .populate({ path: 'posts', options: { sort: { createdAt: 'desc' } } })
       .populate('likes')
       .populate('followers')
@@ -32,6 +38,59 @@ const Query = {
 
     user.newNotifications = user.notifications;
 
+    // Find unseen messages
+    const lastUnseenMessages = await Message.aggregate([
+      {
+        $match: {
+          receiver: mongoose.Types.ObjectId(authUser.id),
+          seen: false,
+        },
+      },
+      {
+        $sort: { createdAt: -1 },
+      },
+      {
+        $group: {
+          _id: '$sender',
+          doc: {
+            $first: '$$ROOT',
+          },
+        },
+      },
+      { $replaceRoot: { newRoot: '$doc' } },
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'sender',
+          foreignField: '_id',
+          as: 'sender',
+        },
+      },
+    ]);
+
+    // Transform data
+    const newConversations = [];
+    lastUnseenMessages.map((u) => {
+      const user = {
+        id: u.sender[0]._id,
+        username: u.sender[0].username,
+        fullName: u.sender[0].fullName,
+        image: u.sender[0].image,
+        lastMessage: u.message,
+        lastMessageCreatedAt: u.createdAt,
+      };
+
+      newConversations.push(user);
+    });
+
+    // Sort users by last created messages date
+    const sortedConversations = newConversations.sort((a, b) =>
+      b.lastMessageCreatedAt.toString().localeCompare(a.lastMessageCreatedAt)
+    );
+
+    // Attach new conversations to auth User
+    user.newConversations = sortedConversations;
+
     return user;
   },
   /**
@@ -39,8 +98,17 @@ const Query = {
    *
    * @param {string} username
    */
-  getUser: async (root, { username }, { User }) => {
-    const user = await User.findOne({ username })
+  getUser: async (root, { username, id }, { User }) => {
+    if (!username && !id) {
+      throw new Error('username or id is required params.');
+    }
+
+    if (username && id) {
+      throw new Error('please pass only username or only id as a param');
+    }
+
+    const query = username ? { username: username } : { _id: id };
+    const user = await User.findOne(query)
       .populate({
         path: 'posts',
         populate: [
@@ -51,12 +119,7 @@ const Query = {
               { path: 'following' },
               {
                 path: 'notifications',
-                populate: [
-                  { path: 'author' },
-                  { path: 'follow' },
-                  { path: 'like' },
-                  { path: 'comment' },
-                ],
+                populate: [{ path: 'author' }, { path: 'follow' }, { path: 'like' }, { path: 'comment' }],
               },
             ],
           },
@@ -70,16 +133,11 @@ const Query = {
       .populate('following')
       .populate({
         path: 'notifications',
-        populate: [
-          { path: 'author' },
-          { path: 'follow' },
-          { path: 'like' },
-          { path: 'comment' },
-        ],
+        populate: [{ path: 'author' }, { path: 'follow' }, { path: 'like' }, { path: 'comment' }],
       });
 
     if (!user) {
-      throw new Error("User with given username doesn't exists.");
+      throw new Error("User with given params doesn't exists.");
     }
 
     return user;
@@ -104,12 +162,7 @@ const Query = {
           { path: 'followers' },
           {
             path: 'notifications',
-            populate: [
-              { path: 'author' },
-              { path: 'follow' },
-              { path: 'like' },
-              { path: 'comment' },
-            ],
+            populate: [{ path: 'author' }, { path: 'follow' }, { path: 'like' }, { path: 'comment' }],
           },
         ],
       })
@@ -135,10 +188,8 @@ const Query = {
   getUsers: async (root, { userId, skip, limit }, { User, Follow }) => {
     // Find user ids, that current user follows
     const userFollowing = [];
-    const follow = await Follow.find({ follower: userId }, { _id: 0 }).select(
-      'user'
-    );
-    follow.map(f => userFollowing.push(f.user));
+    const follow = await Follow.find({ follower: userId }, { _id: 0 }).select('user');
+    follow.map((f) => userFollowing.push(f.user));
 
     // Find users that user is not following
     const query = {
@@ -150,12 +201,7 @@ const Query = {
       .populate('following')
       .populate({
         path: 'notifications',
-        populate: [
-          { path: 'author' },
-          { path: 'follow' },
-          { path: 'like' },
-          { path: 'comment' },
-        ],
+        populate: [{ path: 'author' }, { path: 'follow' }, { path: 'like' }, { path: 'comment' }],
       })
       .skip(skip)
       .limit(limit)
@@ -168,17 +214,17 @@ const Query = {
    *
    * @param {string} searchQuery
    */
-  searchUsers: async (root, { searchQuery }, { User }) => {
+  searchUsers: async (root, { searchQuery }, { User, authUser }) => {
     // Return an empty array if searchQuery isn't presented
     if (!searchQuery) {
       return [];
     }
 
     const users = User.find({
-      $or: [
-        { username: new RegExp(searchQuery, 'i') },
-        { fullName: new RegExp(searchQuery, 'i') },
-      ],
+      $or: [{ username: new RegExp(searchQuery, 'i') }, { fullName: new RegExp(searchQuery, 'i') }],
+      _id: {
+        $ne: authUser.id,
+      },
     }).limit(50);
 
     return users;
@@ -193,11 +239,8 @@ const Query = {
 
     // Find who user follows
     const userFollowing = [];
-    const following = await Follow.find(
-      { follower: userId },
-      { _id: 0 }
-    ).select('user');
-    following.map(f => userFollowing.push(f.user));
+    const following = await Follow.find({ follower: userId }, { _id: 0 }).select('user');
+    following.map((f) => userFollowing.push(f.user));
     userFollowing.push(userId);
 
     // Find random users
@@ -213,9 +256,7 @@ const Query = {
       }
     }
 
-    const randomUsers = await User.find(query)
-      .skip(random)
-      .limit(LIMIT);
+    const randomUsers = await User.find(query).skip(random).limit(LIMIT);
 
     return randomUsers;
   },
@@ -250,10 +291,7 @@ const Mutation = {
    * @param {string} password
    */
   signin: async (root, { input: { emailOrUsername, password } }, { User }) => {
-    const user = await User.findOne().or([
-      { email: emailOrUsername },
-      { username: emailOrUsername },
-    ]);
+    const user = await User.findOne().or([{ email: emailOrUsername }, { username: emailOrUsername }]);
 
     if (!user) {
       throw new Error('User not found.');
@@ -276,11 +314,7 @@ const Mutation = {
    * @param {string} username
    * @param {string} password
    */
-  signup: async (
-    root,
-    { input: { fullName, email, username, password } },
-    { User }
-  ) => {
+  signup: async (root, { input: { fullName, email, username, password } }, { User }) => {
     // Check if user with given email or username already exists
     const user = await User.findOne().or([{ email }, { username }]);
     if (user) {
@@ -310,9 +344,7 @@ const Mutation = {
     // Username validation
     const usernameRegex = /^(?!.*\.\.)(?!.*\.$)[^\W][\w.]{0,29}$/;
     if (!usernameRegex.test(username)) {
-      throw new Error(
-        'Usernames can only use letters, numbers, underscores and periods.'
-      );
+      throw new Error('Usernames can only use letters, numbers, underscores and periods.');
     }
     if (username.length > 20) {
       throw new Error('Username no more than 50 characters.');
@@ -320,14 +352,7 @@ const Mutation = {
     if (username.length < 3) {
       throw new Error('Username min 3 characters.');
     }
-    const frontEndPages = [
-      'forgot-password',
-      'reset-password',
-      'explore',
-      'people',
-      'notifications',
-      'post',
-    ];
+    const frontEndPages = ['forgot-password', 'reset-password', 'explore', 'people', 'notifications', 'post'];
     if (frontEndPages.includes(username)) {
       throw new Error("This username isn't available. Please try another.");
     }
@@ -361,11 +386,7 @@ const Mutation = {
     }
 
     // Set password reset token and it's expiry
-    const token = generateToken(
-      user,
-      process.env.SECRET,
-      RESET_PASSWORD_TOKEN_EXPIRY
-    );
+    const token = generateToken(user, process.env.SECRET, RESET_PASSWORD_TOKEN_EXPIRY);
     const tokenExpiry = Date.now() + RESET_PASSWORD_TOKEN_EXPIRY;
     await User.findOneAndUpdate(
       { _id: user.id },
@@ -395,11 +416,7 @@ const Mutation = {
    * @param {string} token
    * @param {string} password
    */
-  resetPassword: async (
-    root,
-    { input: { email, token, password } },
-    { User }
-  ) => {
+  resetPassword: async (root, { input: { email, token, password } }, { User }) => {
     if (!password) {
       throw new Error('Enter password and Confirm password.');
     }
@@ -417,7 +434,7 @@ const Mutation = {
       },
     });
     if (!user) {
-      throw new Error('This token is either invalid or expired!.');
+      throw new Error('This token is either invalid or expired!');
     }
 
     // Update password, reset token and it's expiry
@@ -439,11 +456,7 @@ const Mutation = {
    * @param {string} imagePublicId
    * @param {bool} isCover is Cover or Profile photo
    */
-  uploadUserPhoto: async (
-    root,
-    { input: { id, image, imagePublicId, isCover } },
-    { User }
-  ) => {
+  uploadUserPhoto: async (root, { input: { id, image, imagePublicId, isCover } }, { User }) => {
     const { createReadStream } = await image;
     const stream = createReadStream();
     const uploadImage = await uploadToCloudinary(stream, 'user', imagePublicId);
@@ -458,21 +471,27 @@ const Mutation = {
         fieldsToUpdate.imagePublicId = uploadImage.public_id;
       }
 
-      const updatedUser = await User.findOneAndUpdate(
-        { _id: id },
-        { ...fieldsToUpdate },
-        { new: true }
-      )
+      const updatedUser = await User.findOneAndUpdate({ _id: id }, { ...fieldsToUpdate }, { new: true })
         .populate('posts')
         .populate('likes');
 
       return updatedUser;
     }
 
-    throw new Error(
-      'Something went wrong while uploading image to Cloudinary.'
-    );
+    throw new Error('Something went wrong while uploading image to Cloudinary.');
   },
 };
 
-export default { Query, Mutation };
+const Subscription = {
+  /**
+   * Subscribes to user's isOnline change event
+   */
+  isUserOnline: {
+    subscribe: withFilter(
+      () => pubSub.asyncIterator(IS_USER_ONLINE),
+      (payload, variables, { authUser }) => variables.authUserId === authUser.id
+    ),
+  },
+};
+
+export default { Query, Mutation, Subscription };
